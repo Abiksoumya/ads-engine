@@ -1,0 +1,39 @@
+# AdEngineAI — Python Agent Sidecar
+# Install: pip install -r requirements.txt
+# Then:    playwright install chromium
+
+# --- Web Framework ---
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-dotenv==1.0.1
+
+# --- LLM — Development ---
+groq==0.11.0
+
+# --- LLM — Production ---
+anthropic==0.34.2
+openai==1.51.0
+
+# --- AI Frameworks ---
+langgraph==0.2.28
+crewai==0.63.0
+pyautogen==0.2.35
+
+# --- Storage — Development ---
+cloudinary==1.41.0
+
+# --- Storage — Production ---
+boto3==1.35.0
+
+# --- Scraping ---
+playwright==1.47.0
+beautifulsoup4==4.12.3
+lxml==5.3.0
+httpx==0.27.2
+
+# --- Data ---
+pydantic==2.9.2
+
+# --- Testing ---
+pytest==8.3.3
+pytest-asyncio==0.24.0
