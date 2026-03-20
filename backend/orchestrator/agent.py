@@ -257,11 +257,39 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     async def _node_qa(self, state: PipelineState) -> PipelineState:
-        await self.progress_callback(state["job_id"], 90, "Quality checking...")
-        logger.info(f"Pipeline node: qa (stub) | job: {state['job_id']}")
+        await self.progress_callback(state["job_id"], 90, "Quality checking videos...")
+        logger.info(f"Pipeline node: qa | job: {state['job_id']}")
+        try:
+            from qa.agent import QAAgent
+            from production.crew import RenderResult
 
-        # Week 3: AutoGen QA checks rendered videos
-        return state
+            agent = QAAgent()
+
+            # confidence_score — safe access
+            research = state.get("research")
+            confidence = research.confidence_score if research is not None else 1.0
+
+            # videos — ensure correct type
+            raw_videos = state.get("videos", [])
+            render_results: list[RenderResult] = [
+                v for v in raw_videos if isinstance(v, RenderResult)
+            ]
+
+            qa_results = await agent.review(render_results, confidence)
+            publishable = sum(1 for r in qa_results if r.is_publishable)
+
+            await self.progress_callback(
+                state["job_id"], 92,
+                f"QA complete — {publishable}/{len(qa_results)} publishable"
+            )
+            return {**state, "status": "scripts_ready"}
+
+        except Exception as e:
+            logger.error(f"QA node failed: {e}")
+            return {
+                **state,
+                "warnings": state["warnings"] + [f"QA failed: {e}"],
+            }
 
     # ------------------------------------------------------------------
     # Node 5 — Publisher (stub — Week 4)
