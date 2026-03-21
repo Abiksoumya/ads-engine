@@ -28,6 +28,9 @@ from app.middleware.security import setup_middleware
 from app.routes.auth_routes import router as auth_router
 from app.routes.user_routes import router as user_router
 from app.routes.brand_routes import router as brand_router
+from app.routes.campaign_routes import router as campaign_router
+from app.routes.render_routes import router as render_router
+
 
 
 
@@ -138,8 +141,9 @@ app.include_router(auth_router)
 
 # Future routers — add as we build each module
 app.include_router(user_router)
-# app.include_router(campaign_router)
+app.include_router(campaign_router)
 app.include_router(brand_router)
+app.include_router(render_router)
 # app.include_router(subscription_router)
 # app.include_router(publish_router)
 

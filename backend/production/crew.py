@@ -170,12 +170,10 @@ class RenderAgent:
             for ratio, video in videos.items():
                 if video.success and not video.is_mock:
                     try:
-                        # fetch video bytes from D-ID URL then upload to our storage
                         import httpx
                         async with httpx.AsyncClient(timeout=60.0) as client:
                             r = await client.get(video.video_url)
                             video_bytes = r.content
-
                         stored_url = await self.storage.upload_video(
                             file_bytes=video_bytes,
                             campaign_id=self.campaign_id,
@@ -185,7 +183,8 @@ class RenderAgent:
                         )
                         video.video_url = stored_url
                     except Exception as e:
-                        logger.warning(f"Video upload failed ({ratio}): {e}")
+                        logger.warning(f"Video upload to storage failed ({ratio}): {e} — keeping D-ID URL")
+                        # D-ID URL stays as-is — already set, don't overwrite
 
             result.video_9x16 = videos.get("9x16")
             result.video_1x1 = videos.get("1x1")
