@@ -26,6 +26,10 @@ from app.core.exceptions import AppException
 from app.db.database import check_connection, create_tables
 from app.middleware.security import setup_middleware
 from app.routes.auth_routes import router as auth_router
+from app.routes.user_routes import router as user_router
+from app.routes.brand_routes import router as brand_router
+
+
 
 # Configure logging
 logging.basicConfig(
@@ -133,9 +137,9 @@ async def generic_exception_handler(request: Request, exc: Exception) -> JSONRes
 app.include_router(auth_router)
 
 # Future routers — add as we build each module
-# app.include_router(user_router)
+app.include_router(user_router)
 # app.include_router(campaign_router)
-# app.include_router(brand_router)
+app.include_router(brand_router)
 # app.include_router(subscription_router)
 # app.include_router(publish_router)
 
