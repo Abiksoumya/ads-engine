@@ -43,10 +43,6 @@ class RenderService:
         script_ids: list[UUID] | None = None,
         voice_style: str = "professional",
     ) -> dict:
-        """
-        Triggers video rendering as a background task.
-        Returns immediately.
-        """
         # Verify ownership
         campaign = await self._get_campaign(campaign_id, user_id)
 
@@ -74,23 +70,78 @@ class RenderService:
             .values(status=CampaignStatusEnum.RENDERING)
         )
 
-        # Trigger background render
-        asyncio.create_task(
-            self._run_render(
-                campaign_id=campaign_id,
-                scripts=scripts,
-                voice_style=voice_style,
-            )
+        # Dispatch to Celery queue
+        from tasks.render_tasks import run_render_task
+        run_render_task.delay(  # type: ignore[attr-defined]
+            campaign_id=str(campaign_id),
+            script_ids=[str(s.id) for s in scripts],
+            voice_style=voice_style,
         )
 
-        logger.info(f"Render triggered for campaign: {campaign_id} ({len(scripts)} scripts)")
+        logger.info(f"Render queued: {campaign_id} ({len(scripts)} scripts)")
 
         return {
             "campaign_id": str(campaign_id),
             "scripts_queued": len(scripts),
             "status": "rendering",
-            "message": f"Rendering {len(scripts)} videos. Check status for progress. Takes 3-8 minutes.",
+            "message": f"Rendering {len(scripts)} videos. Check status for progress.",
         }
+
+    # async def trigger_render(
+    #     self,
+    #     campaign_id: UUID,
+    #     user_id: UUID,
+    #     script_ids: list[UUID] | None = None,
+    #     voice_style: str = "professional",
+    # ) -> dict:
+    #     """
+    #     Triggers video rendering as a background task.
+    #     Returns immediately.
+    #     """
+    #     # Verify ownership
+    #     campaign = await self._get_campaign(campaign_id, user_id)
+
+    #     # Must have scripts before rendering
+    #     if str(campaign.status.value) == "pending":
+    #         raise ValidationException(
+    #             "Campaign scripts are not ready yet. Wait for status 'complete' first."
+    #         )
+
+    #     # Load scripts
+    #     query = select(Script).where(Script.campaign_id == campaign_id)
+    #     if script_ids:
+    #         query = query.where(Script.id.in_(script_ids))
+
+    #     result = await self.db.execute(query)
+    #     scripts = list(result.scalars().all())
+
+    #     if not scripts:
+    #         raise ValidationException("No scripts found for this campaign")
+
+    #     # Update status to rendering
+    #     await self.db.execute(
+    #         update(Campaign)
+    #         .where(Campaign.id == campaign_id)
+    #         .values(status=CampaignStatusEnum.RENDERING)
+    #     )
+
+    #     # Trigger background render
+    #     asyncio.create_task(
+    #         self._run_render(
+    #             campaign_id=campaign_id,
+    #             scripts=scripts,
+    #             voice_style=voice_style,
+    #         )
+    #     )
+
+    #     logger.info(f"Render triggered for campaign: {campaign_id} ({len(scripts)} scripts)")
+
+    #     return {
+    #         "campaign_id": str(campaign_id),
+    #         "scripts_queued": len(scripts),
+    #         "status": "rendering",
+    #         "message": f"Rendering {len(scripts)} videos. Check status for progress. Takes 3-8 minutes.",
+    #     }
 
     async def get_videos(self, campaign_id: UUID, user_id: UUID) -> dict:
         """Returns all video URLs for a campaign."""
