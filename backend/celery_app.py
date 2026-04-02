@@ -40,7 +40,8 @@ celery_app = Celery(
     include=[
         "tasks.campaign_tasks",
         "tasks.render_tasks",
-    ],
+        "tasks.video_creation_tasks", 
+                ],
 )
 
 celery_app.conf.update(

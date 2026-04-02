@@ -15,6 +15,8 @@ from app.models.brand import BrandDNA
 from app.models.campaign import Campaign, Script, RenderResult, CampaignStatusEnum
 from app.models.publish import PublishJob, PlatformConnection, PublishStatusEnum
 from app.models.audit import AuditLog
+from app.models.video_creation import VideoCreation, CreationStatus
+from app.models.video_brief import VideoBrief, BriefStatus
 
 __all__ = [
     "Base", "utcnow", "new_uuid",
@@ -24,4 +26,6 @@ __all__ = [
     "Campaign", "Script", "RenderResult", "CampaignStatusEnum",
     "PublishJob", "PlatformConnection", "PublishStatusEnum",
     "AuditLog",
+    "VideoCreation", "CreationStatus",
+    "VideoBrief", "BriefStatus",
 ]

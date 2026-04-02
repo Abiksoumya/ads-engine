@@ -30,6 +30,9 @@ from app.routes.user_routes import router as user_router
 from app.routes.brand_routes import router as brand_router
 from app.routes.campaign_routes import router as campaign_router
 from app.routes.render_routes import router as render_router
+from app.routes.admin_routes import router as admin_router
+from app.routes.video_brief_routes import router as video_brief_router
+from app.routes.video_creation_routes import router as video_creation_router
 
 
 
@@ -146,6 +149,9 @@ app.include_router(brand_router)
 app.include_router(render_router)
 # app.include_router(subscription_router)
 # app.include_router(publish_router)
+app.include_router(admin_router)
+app.include_router(video_brief_router)
+app.include_router(video_creation_router)
 
 
 # ---------------------------------------------------------------------------

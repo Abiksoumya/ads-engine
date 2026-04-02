@@ -33,11 +33,17 @@ class EditScriptRequest(BaseModel):
 
 
 class RenderRequest(BaseModel):
-    script_ids: list[UUID] | None = None   # None = render all 5
+    script_ids: list[UUID] | None = None
     voice_style: str = Field(
         default="professional",
         pattern="^(professional|casual|energetic|warm|authoritative)$",
     )
+    aspect_ratio: str = Field(
+        default="9:16",
+        pattern="^(9:16|1:1|16:9|all)$",
+        description="9:16=TikTok/Reels | 1:1=Instagram Feed | 16:9=YouTube | all=all 3 formats (3x cost)",
+    )
+    force: bool = False
 
 
 # ---------------------------------------------------------------------------

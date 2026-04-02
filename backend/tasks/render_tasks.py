@@ -1,10 +1,19 @@
 """
-AdEngineAI — Render Task
-==========================
-Celery task that runs video rendering.
-Includes ElevenLabs stagger fix — requests sent 0.3s apart.
+AdEngineAI — Render Task (Updated)
+=====================================
+Celery task for Campaign video rendering (Flow 1).
 
-Replaces asyncio.create_task in render_service.py
+Pipeline:
+  1. Load campaign scripts + video briefs from DB
+  2. Generate voiceover per script (ElevenLabs)
+  3. Generate video scenes per script (fal.ai Kling)
+  4. Stitch scenes + audio (FFmpeg)
+  5. Run QA review
+  6. Save final video URLs to DB
+  7. Update campaign status to complete
+
+Replaces D-ID with fal.ai Kling + FFmpeg.
+Queue: render
 """
 
 import asyncio
@@ -14,8 +23,6 @@ import sys
 from uuid import UUID
 
 from celery import Task
-import json
-
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -41,29 +48,23 @@ class RenderTask(Task):
     queue="render",
     max_retries=1,
     default_retry_delay=60,
-    soft_time_limit=600,    # 10 min soft limit
-    time_limit=660,         # 11 min hard limit
+    soft_time_limit=900,
+    time_limit=960,
 )
 def run_render_task(
     self,
     campaign_id: str,
     script_ids: list[str],
     voice_style: str = "professional",
+    aspect_ratio: str = "9:16",
 ):
-    """
-    Renders videos for a campaign.
-    Called via: run_render_tasktrigger_render campaign_id, script_ids, voice_style)
-
-    Includes ElevenLabs stagger — requests sent 0.3s apart to avoid
-    concurrent limit (4 max on free/starter plan).
-    """
-    logger.info(f"Render task started: {campaign_id} ({len(script_ids)} scripts)")
-
+    logger.info(f"Render task started: {campaign_id} ({len(script_ids)} scripts, {aspect_ratio})")
     try:
         asyncio.run(_run_render_async(
             campaign_id=campaign_id,
             script_ids=script_ids,
             voice_style=voice_style,
+            aspect_ratio=aspect_ratio,
         ))
     except Exception as exc:
         logger.error(f"Render task failed: {campaign_id} — {exc}")
@@ -74,30 +75,23 @@ def run_render_task(
             raise
 
 
-async def _run_render_async(
-    campaign_id: str,
-    script_ids: list[str],
-    voice_style: str,
-):
-    """Async render implementation with ElevenLabs stagger."""
+async def _run_render_async(campaign_id, script_ids, voice_style, aspect_ratio):
     from dotenv import load_dotenv
     load_dotenv()
-
-    agents_path = os.path.join(os.path.dirname(__file__), "..", "agents")
-    if agents_path not in sys.path:
-        sys.path.insert(0, agents_path)
 
     from sqlalchemy import select, update
     from app.db.database import AsyncSessionFactory
     from app.models.campaign import Campaign, Script, RenderResult, CampaignStatusEnum
+    from app.dao.video_brief_dao import VideoBriefDAO
+    from app.models.video_brief import BriefStatus
+    from mcp_tools.fal_kling_tools import FalKlingTool
+    from mcp_tools.ffmpeg_tools import FFmpegStitcher
+    from mcp_tools.elevenlabs_tools import ElevenLabsTool
 
     async with AsyncSessionFactory() as db:
         try:
-            from production.crew import ProductionCrew, RenderAgent
-            from qa.agent import QAAgent
-            from director.agent import Script as AgentScript, HookScore
+            brief_dao = VideoBriefDAO(db)
 
-            # Load scripts from DB
             result = await db.execute(
                 select(Script).where(
                     Script.campaign_id == UUID(campaign_id),
@@ -110,238 +104,196 @@ async def _run_render_async(
                 logger.error(f"No scripts found for campaign {campaign_id}")
                 return
 
-            # Build AgentScript objects
-            agent_scripts = []
-            for s in scripts:
-                hook_score_val = s.hook_score
-                hook_trigger = s.hook_trigger
-                hook_reasoning = s.hook_reasoning
-                best_platform = s.best_platform
-                hashtags = s.hashtags
+            kling = FalKlingTool()
+            stitcher = FFmpegStitcher()
+            elevenlabs = ElevenLabsTool()
 
-                raw_hashtags = s.hashtags
-                if raw_hashtags is not None:
-                    hashtags = json.loads(json.dumps(raw_hashtags))
-                else:
-                    hashtags = []
-
-
-                hook_score = HookScore(
-                    score=int(str(hook_score_val)) if hook_score_val is not None else 50,
-                    primary_trigger=str(hook_trigger) if hook_trigger is not None else "unknown",
-                    reasoning=str(hook_reasoning) if hook_reasoning is not None else "",
-                    best_platform=str(best_platform) if best_platform is not None else "instagram",
-                )
-                agent_script = AgentScript(
-                    hook_type=str(s.hook_type),
-                    hook_line=str(s.hook_line),
-                    script=str(s.script_text),
-                    hook_score=hook_score,
-                    ad_headline=str(s.ad_headline) if s.ad_headline is not None else "",
-                    ad_description=str(s.ad_description) if s.ad_description is not None else "",
-                    caption_instagram=str(s.caption_instagram) if s.caption_instagram is not None else "",
-                    caption_tiktok=str(s.caption_tiktok) if s.caption_tiktok is not None else "",
-                    caption_linkedin=str(s.caption_linkedin) if s.caption_linkedin is not None else "",
-                    hashtags=hashtags,
-                )
-                agent_scripts.append(agent_script)
-
-            # ----------------------------------------------------------------
-            # ElevenLabs stagger fix
-            # Send requests 0.3s apart to stay within 4 concurrent limit
-            # ----------------------------------------------------------------
-            crew = ProductionCrew(
-                campaign_id=campaign_id,
-                voice_style=voice_style,
-            )
-
-            # Override render to use staggered execution
-            render_results = await _render_with_stagger(crew, agent_scripts)
-
-            # Run QA
-            qa_agent = QAAgent()
-            qa_results = await qa_agent.review(render_results)
-
-            # Save to DB
-            for i, (render, qa) in enumerate(zip(render_results, qa_results)):
-                script = scripts[i]
-
-                # Check if render result already exists for this script
-                existing = await db.execute(
-                    select(RenderResult).where(RenderResult.script_id == script.id)
-                )
-                existing_render = existing.scalar_one_or_none()
-
-                render_data = dict(
-                    audio_url=render.audio.audio_url if render.audio and render.audio.audio_url else None,
-                    audio_duration_secs=render.audio.duration_secs if render.audio else None,
-                    is_mock_audio=render.audio.is_mock if render.audio else True,
-                    video_url_9x16=render.video_9x16.video_url if render.video_9x16 and render.video_9x16.video_url else None,
-                    video_url_1x1=render.video_1x1.video_url if render.video_1x1 and render.video_1x1.video_url else None,
-                    video_url_16x9=render.video_16x9.video_url if render.video_16x9 and render.video_16x9.video_url else None,
-                    is_mock_video=render.video_9x16.is_mock if render.video_9x16 else True,
-                    qa_passed=qa.passed,
-                    qa_severity=qa.severity,
-                    qa_issues=qa.issues,
-                    qa_recommendation=qa.recommendation,
-                    provider=render.video_9x16.provider if render.video_9x16 else "mock",
-                    render_error=str(render.errors[0]) if render.errors else None,
-                )
-
-                if existing_render:
-                    # Update existing render result
-                    await db.execute(
-                        update(RenderResult)
-                        .where(RenderResult.script_id == script.id)
-                        .values(**render_data)
+            for script in scripts:
+                try:
+                    await _render_one_script(
+                        db=db,
+                        script=script,
+                        brief_dao=brief_dao,
+                        kling=kling,
+                        stitcher=stitcher,
+                        elevenlabs=elevenlabs,
+                        voice_style=voice_style,
+                        aspect_ratio=aspect_ratio,
                     )
-                else:
-                    # Create new render result
-                    db_render = RenderResult(script_id=script.id, **render_data)
-                    db.add(db_render)
+                except Exception as e:
+                    logger.error(f"Script {script.id} render failed: {e} — continuing")
+                    await _save_failed_render(db, script.id, str(e))
 
-            await db.commit()
+                await asyncio.sleep(2)
 
-            # Update campaign status
             await db.execute(
                 update(Campaign)
                 .where(Campaign.id == UUID(campaign_id))
                 .values(status=CampaignStatusEnum.COMPLETE)
             )
             await db.commit()
-
-            logger.info(f"Render complete: {campaign_id}")
+            logger.info(f"Campaign render complete: {campaign_id}")
 
         except Exception as e:
-            logger.error(f"Render failed: {campaign_id} — {e}")
+            logger.error(f"Campaign render failed: {campaign_id} — {e}")
             await db.rollback()
             await db.execute(
                 update(Campaign)
                 .where(Campaign.id == UUID(campaign_id))
-                .values(
-                    status=CampaignStatusEnum.FAILED,
-                    error_message=str(e),
-                )
+                .values(status=CampaignStatusEnum.FAILED, error_message=str(e))
             )
             await db.commit()
             raise
 
-async def _render_with_stagger(crew, agent_scripts: list) -> list:
-    """
-    Renders scripts sequentially with 1s gap.
-    Sequential prevents ElevenLabs concurrent limit (4 max).
-    All 5 scripts succeed every time.
-    """
-    from production.crew import RenderAgent
-    from mcp_tools.elevenlabs_tools import AudioResult
-    from mcp_tools.did_tools import VideoResult
-    from production.crew import RenderResult as AgentRenderResult
 
-    results = []
-    for i, script in enumerate(agent_scripts):
-        logger.info(f"Rendering {i+1}/5: {script.hook_type}")
-        try:
-            agent = RenderAgent(
-                script=script,
-                campaign_id=crew.campaign_id,
-                voice_style=crew.voice_style,
-                elevenlabs=crew.elevenlabs,
-                did=crew.did,
-                storage=crew.storage,
-            )
-            result = await agent.render()
-            results.append(result)
-            if i < len(agent_scripts) - 1:
-                await asyncio.sleep(1)
-        except Exception as e:
-            logger.error(f"Script {i} render failed: {e}")
-            results.append(AgentRenderResult(
-                hook_type=script.hook_type,
-                script=script,
-                audio=AudioResult(
-                    hook_type=script.hook_type,
-                    audio_url="",
-                    audio_bytes=b"",
-                    voice_id="",
-                    duration_secs=0,
-                    is_mock=True,
-                ),
-                video_9x16=VideoResult(
-                    hook_type=script.hook_type,
-                    video_url="",
-                    thumbnail_url="",
-                    duration_secs=0,
-                    aspect_ratio="9x16",
-                    provider="mock",
-                    is_mock=True,
-                ),
-                video_1x1=None,
-                video_16x9=None,
-                errors=[str(e)],
-            ))
+async def _render_one_script(db, script, brief_dao, kling, stitcher, elevenlabs, voice_style, aspect_ratio):
+    from sqlalchemy import select, update
+    from app.models.campaign import RenderResult
+    from app.models.video_brief import BriefStatus
 
-    return results
-# async def _render_with_stagger(crew, agent_scripts: list) -> list:
-#     """Renders all scripts with 0.3s stagger between ElevenLabs requests."""
-#     from production.crew import RenderAgent
-#     from mcp_tools.elevenlabs_tools import AudioResult
-#     from mcp_tools.did_tools import VideoResult
-#     from production.crew import RenderResult as AgentRenderResult
+    script_id = UUID(str(script.id))
+    logger.info(f"Rendering script {script_id} ({script.hook_type})")
 
-#     async def render_one(script, delay: float):
-#         await asyncio.sleep(delay)
-#         agent = RenderAgent(
-#             script=script,
-#             campaign_id=crew.campaign_id,
-#             voice_style=crew.voice_style,
-#             elevenlabs=crew.elevenlabs,
-#             did=crew.did,
-#             storage=crew.storage,
-#         )
-#         return await agent.render()
+    brief = await brief_dao.get_by_script_id(script_id)
 
-#     results = await asyncio.gather(
-#         *[render_one(script, i * 0.3) for i, script in enumerate(agent_scripts)],
-#         return_exceptions=True,
-#     )
+    if not brief:
+        scenes = _default_scenes_from_script(script)
+        voiceover_script = str(script.script_text)
+        hook_text = str(script.hook_line)
+        cta_text = "Shop now"
+    else:
+        scenes = brief.scenes or []
+        voiceover_script = str(brief.voiceover_script or script.script_text)
+        hook_text = scenes[0].get("text_overlay", "") if scenes else str(script.hook_line)
+        cta_text = scenes[-1].get("text_overlay", "Shop now") if scenes else "Shop now"
 
-#     safe_results = []
-#     for i, result in enumerate(results):
-#         if isinstance(result, Exception):
-#             logger.error(f"Script {i} render failed: {result}")
-#             failed = AgentRenderResult(
-#                 hook_type=agent_scripts[i].hook_type,
-#                 script=agent_scripts[i],
-#                 audio=AudioResult(
-#                     hook_type=agent_scripts[i].hook_type,
-#                     audio_url="",
-#                     audio_bytes=b"",
-#                     voice_id="",
-#                     duration_secs=0,
-#                     is_mock=True,
-#                 ),
-#                 video_9x16=VideoResult(
-#                     hook_type=agent_scripts[i].hook_type,
-#                     video_url="",
-#                     thumbnail_url="",
-#                     duration_secs=0,
-#                     aspect_ratio="9x16",
-#                     provider="mock",
-#                     is_mock=True,
-#                 ),
-#                 video_1x1=None,
-#                 video_16x9=None,
-#                 errors=[str(result)],
-#             )
-#             safe_results.append(failed)
-#         else:
-#             safe_results.append(result)
+    # Generate voiceover
+    audio_result = await elevenlabs.generate_audio(text=voiceover_script, voice_style=voice_style)
+    audio_url = audio_result.audio_url or ""
 
-#     return safe_results
+    # Generate Kling scenes
+    scene_clips = []
+    for scene in scenes:
+        image_url = scene.get("product_image_url") if scene.get("use_product_image") else None
+        result = await kling.generate_scene(
+            prompt=scene.get("kling_prompt", ""),
+            duration=scene.get("duration", 10),
+            aspect_ratio=aspect_ratio if aspect_ratio != "all" else "9:16",
+            hook_type=str(script.hook_type),
+            scene_number=scene.get("scene_number", 1),
+            image_url=image_url,
+        )
+        if result.video_url:
+            scene_clips.append(result.video_url)
+        else:
+            logger.warning(f"Scene {scene.get('scene_number')} failed: {result.error}")
+        await asyncio.sleep(1)
+
+    # Stitch
+    final_video_url = ""
+    if scene_clips and audio_url:
+        stitch_result = await stitcher.stitch(
+            scene_urls=scene_clips,
+            audio_url=audio_url,
+            hook_text=hook_text,
+            cta_text=cta_text,
+            aspect_ratio=aspect_ratio if aspect_ratio != "all" else "9:16",
+            subtitles=False,
+            voiceover_script=voiceover_script,
+        )
+        if stitch_result.success:
+            final_video_url = stitch_result.video_url
+        else:
+            logger.error(f"Stitch failed: {stitch_result.error}")
+
+    # QA
+    qa_passed = bool(final_video_url and audio_url)
+    qa_severity = "none" if qa_passed else "critical"
+    qa_issues = [] if qa_passed else ["Video or audio generation failed"]
+    qa_recommendation = "Approved" if qa_passed else "Re-render required"
+
+    # Save render result
+    video_9x16 = final_video_url if aspect_ratio in ("9:16", "all") else None
+    video_1x1 = final_video_url if aspect_ratio in ("1:1", "all") else None
+    video_16x9 = final_video_url if aspect_ratio in ("16:9", "all") else None
+
+    render_data = dict(
+        audio_url=audio_url or None,
+        audio_duration_secs=None,
+        is_mock_audio=getattr(audio_result, 'is_mock', False),
+        video_url_9x16=video_9x16,
+        video_url_1x1=video_1x1,
+        video_url_16x9=video_16x9,
+        is_mock_video=kling.is_mock,
+        qa_passed=qa_passed,
+        qa_severity=qa_severity,
+        qa_issues=qa_issues,
+        qa_recommendation=qa_recommendation,
+        provider="kling",
+        render_error=None,
+    )
+
+    existing = await db.execute(select(RenderResult).where(RenderResult.script_id == script.id))
+    existing_render = existing.scalar_one_or_none()
+
+    if existing_render:
+        await db.execute(update(RenderResult).where(RenderResult.script_id == script.id).values(**render_data))
+    else:
+        db.add(RenderResult(script_id=script.id, **render_data))
+
+    if brief:
+        await brief_dao.update_status(
+            UUID(str(brief.id)),
+            BriefStatus.COMPLETE if final_video_url else BriefStatus.FAILED,
+        )
+
+    await db.commit()
+    logger.info(f"Script {script_id} render saved")
 
 
-async def _mark_render_failed(campaign_id: str, error: str):
-    """Marks campaign as failed after max retries."""
+def _default_scenes_from_script(script) -> list[dict]:
+    hook_line = str(script.hook_line)
+    hook_type = str(script.hook_type)
+    return [
+        {
+            "scene_number": 1, "duration": 10,
+            "text_overlay": hook_line, "use_product_image": True, "product_image_url": None,
+            "kling_prompt": f"Professional product advertisement, {hook_type} hook, clean studio, cinematic lighting, slow camera, 4K, advertisement style",
+        },
+        {
+            "scene_number": 2, "duration": 10,
+            "text_overlay": None, "use_product_image": True, "product_image_url": None,
+            "kling_prompt": "Product lifestyle shot, natural environment, golden hour lighting, cinematic slow motion, 4K, advertisement style",
+        },
+        {
+            "scene_number": 3, "duration": 10,
+            "text_overlay": "Shop now", "use_product_image": True, "product_image_url": None,
+            "kling_prompt": "Clean product hero shot, white background, professional studio lighting, sharp focus, 4K, advertisement style",
+        },
+    ]
+
+
+async def _save_failed_render(db, script_id, error: str) -> None:
+    from sqlalchemy import select, update
+    from app.models.campaign import RenderResult
+
+    existing = await db.execute(select(RenderResult).where(RenderResult.script_id == script_id))
+    existing_render = existing.scalar_one_or_none()
+    render_data = dict(
+        is_mock_video=True, is_mock_audio=True,
+        qa_passed=False, qa_severity="critical",
+        qa_issues=[f"Render failed: {error}"],
+        qa_recommendation="Re-render required",
+        provider="kling", render_error=error,
+    )
+    if existing_render:
+        await db.execute(update(RenderResult).where(RenderResult.script_id == script_id).values(**render_data))
+    else:
+        db.add(RenderResult(script_id=script_id, **render_data))
+    await db.commit()
+
+
+async def _mark_render_failed(campaign_id: str, error: str) -> None:
     from sqlalchemy import update
     from app.db.database import AsyncSessionFactory
     from app.models.campaign import Campaign, CampaignStatusEnum
@@ -350,9 +302,6 @@ async def _mark_render_failed(campaign_id: str, error: str):
         await db.execute(
             update(Campaign)
             .where(Campaign.id == UUID(campaign_id))
-            .values(
-                status=CampaignStatusEnum.FAILED,
-                error_message=f"Render failed after retries: {error}",
-            )
+            .values(status=CampaignStatusEnum.FAILED, error_message=f"Render failed after retries: {error}")
         )
         await db.commit()

@@ -112,6 +112,12 @@ class Script(Base):
         back_populates="script",
         cascade="all, delete-orphan",
     )
+    video_brief = relationship(
+        "VideoBrief",
+        back_populates="script",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
 
 
 class RenderResult(Base):
